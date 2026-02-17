@@ -26,41 +26,79 @@ spin() {
     printf "\r[%s] ✔ %s\n" "$step" "$text"
 }
 
+# --- CURRENT USER ---
+current_user=$(whoami)
+protected_user="$current_user"
+
 # --- [0/11] WARNING ---
 echo -e "\e[1;31mFINISH FORENSICS QUESTIONS BEFORE RUNNING THIS. ONLY RUN THIS SCRIPT IF THEY ARE DONE OR YOU GIVE UP.\e[0m"
-read -p "If you acknowledge, press Enter..." 
+read -p "If you acknowledge, press Enter..."
 
-# --- [1/11] USER AUDIT & ADMIN LIST ---
-current_user=$(whoami)
-admins_list="$current_user "
-echo "The current user '$current_user' will be automatically included as an admin."
+# --- [1/11] USER AUDIT WITH NANO INPUT ---
+echo "--- [1/11] USER AUDIT WITH NANO INPUT ---"
+tmp_audit_file=$(mktemp /tmp/user_audit.XXXX)
+echo "# Paste user audit here:" > "$tmp_audit_file"
+echo "# Format example:" >> "$tmp_audit_file"
+echo "# Authorized Administrators:" >> "$tmp_audit_file"
+echo "# ballen (you)" >> "$tmp_audit_file"
+echo "#     password: (blank/none)" >> "$tmp_audit_file"
+echo "# iwest" >> "$tmp_audit_file"
+echo "#     password: JITTerS" >> "$tmp_audit_file"
+echo "# Authorized Users:" >> "$tmp_audit_file"
+echo "# cramonn" >> "$tmp_audit_file"
+echo "# hrathaway" >> "$tmp_audit_file"
+nano "$tmp_audit_file"
 
-echo "Enter AUTHORIZED NORMAL USERS (Type 'admins' when finished):"
+declare -A admin_passwords
 users_list=""
-while true; do
-    read -p "> " entry
-    [[ "$entry" == "admins" ]] && break
-    [[ -n "$entry" ]] && users_list+="$entry "
-done
+admins_list="$current_user "  # Protect current user automatically
+section=""
+last_admin=""
 
-echo "Enter AUTHORIZED ADMINS (Type 'done' when finished):"
-while true; do
-    read -p "> " entry
-    [[ "$entry" == "done" ]] && break
-    [[ -n "$entry" ]] && admins_list+="$entry "
-done
+while IFS= read -r line; do
+    line=$(echo "$line" | xargs)   # trim whitespace
+    [[ -z "$line" ]] && continue    # skip empty
+    [[ "$line" =~ ^# ]] && continue # skip comments
+
+    case "$line" in
+        "Authorized Administrators:"|"Authorized Users:")
+            section="$line"
+            continue
+            ;;
+    esac
+
+    if [[ "$section" == "Authorized Administrators:" ]]; then
+        if [[ "$line" =~ ^password:\ (.+)$ ]]; then
+            admin_passwords["$last_admin"]="${BASH_REMATCH[1]}"
+        else
+            last_admin="$line"
+            admins_list+="$line "
+        fi
+    elif [[ "$section" == "Authorized Users:" ]]; then
+        users_list+="$line "
+    fi
+done < "$tmp_audit_file"
+
+rm -f "$tmp_audit_file"
 
 all_authorized="$users_list $admins_list"
 
-# --- USER AUDIT ---
-echo "--- [1/11] STARTING USER AUDIT ---"
+echo "Admins found: $admins_list"
+echo "Standard users found: $users_list"
+
+# --- [1a/11] USER AUDIT: Remove unauthorized users ---
+echo "--- [1a/11] USER AUDIT ---"
 while true; do
     for user in $(awk -F: '$3 >= 1000 && $3 <= 6000 {print $1}' /etc/passwd); do
         if [[ ! " $all_authorized " =~ " $user " ]]; then
             echo "ALERT: Unauthorized user found: $user"
             read -p "Delete user $user? (y/n/cancel): " choice
             if [[ "$choice" == "y" ]]; then
-                sudo deluser --remove-home "$user" >>"$LOGFILE" 2>>"$ERROR_LOG"
+                if [ "$user" = "$protected_user" ]; then
+                    echo "WARNING: Cannot delete current user $user to prevent lockout."
+                    continue
+                fi
+                (sudo deluser --remove-home "$user" >>"$LOGFILE" 2>>"$ERROR_LOG") & spin $! "1a/11" "Removing user $user"
                 echo "User $user removed."
             elif [[ "$choice" == "cancel" ]]; then
                 echo "Audit cancelled."
@@ -74,33 +112,117 @@ while true; do
     [[ "$redo" != "redo" ]] && break
 done
 
-# --- [1b/11] ADMIN PASSWORD UPDATE ---
+# --- [1b/11] ADMIN PASSWORD UPDATE WITH COMPLEXITY CHECK ---
 echo "--- [1b/11] ADMIN PASSWORD UPDATES ---"
-for admin in $admins_list; do
-    echo "Processing admin: $admin"
-    valid=false
-    while [ "$valid" == false ]; do
-        read -p "Enter new password for $admin: " new_pass
-        echo ""
-        # Complexity check
-        has_upper=false; has_number=false; has_symbol=false
-        [[ "$new_pass" =~ [A-Z] ]] && has_upper=true
-        [[ "$new_pass" =~ [0-9] ]] && has_number=true
-        if echo "$new_pass" | grep -q '[!@#$%^&*()_+%-]'; then has_symbol=true; fi
 
-        if [[ ${#new_pass} -ge 8 ]] && $has_upper && $has_number && $has_symbol; then
-            read -p "Confirm and apply? (y/n): " confirm
-            if [[ "$confirm" == "y" ]]; then
-                echo "$admin:$new_pass" | sudo chpasswd >>"$LOGFILE" 2>>"$ERROR_LOG"
-                echo "Password updated for $admin."
-                valid=true
+for admin in $admins_list; do
+    # Skip password update for current user
+    if [ "$admin" == "$protected_user" ]; then
+        echo "Skipping password update for current user: $admin"
+        continue
+    fi
+
+    current_pass="${admin_passwords[$admin]}"
+    need_change=false
+
+    # Check if password is blank or weak
+    if [[ -z "$current_pass" || "$current_pass" == "(blank/none)" ]]; then
+        need_change=true
+    else
+        # Complexity checks: length 8+, uppercase, number, symbol
+        if [[ ${#current_pass} -lt 8 ]]; then
+            need_change=true
+        elif ! [[ "$current_pass" =~ [A-Z] ]]; then
+            need_change=true
+        elif ! [[ "$current_pass" =~ [0-9] ]]; then
+            need_change=true
+        elif ! echo "$current_pass" | grep -q '[!@#$%^&*()_+%-]'; then
+            need_change=true
+        fi
+    fi
+
+    if [ "$need_change" = true ]; then
+        echo "Password reset required for admin: $admin"
+        valid=false
+        while [ "$valid" == false ]; do
+            read -p "Enter new password for $admin: " new_pass
+            echo ""
+            # --- Complexity check ---
+            has_upper=false; has_number=false; has_symbol=false
+            [[ "$new_pass" =~ [A-Z] ]] && has_upper=true
+            [[ "$new_pass" =~ [0-9] ]] && has_number=true
+            if echo "$new_pass" | grep -q '[!@#$%^&*()_+%-]'; then has_symbol=true; fi
+
+            if [[ ${#new_pass} -ge 8 ]] && $has_upper && $has_number && $has_symbol; then
+                read -p "Confirm and apply? (y/n): " confirm
+                if [[ "$confirm" == "y" ]]; then
+                    (echo "$admin:$new_pass" | sudo chpasswd >>"$LOGFILE" 2>>"$ERROR_LOG") & spin $! "1b/11" "Updating password for $admin"
+                    echo "Password updated for $admin."
+                    valid=true
+                fi
+            else
+                echo "ERROR: Password must have 8+ chars, 1 uppercase, 1 number, 1 symbol." | tee -a "$ERROR_LOG"
             fi
+        done
+    else
+        echo "Password for admin $admin meets complexity requirements. No change needed."
+    fi
+done
+
+# --- [1c/11] UNIVERSAL ADMIN PRIVILEGE AUDIT WITH SPINNER AND GUARDRAILS ---
+echo "--- [1c/11] ADMIN PRIVILEGE AUDIT (UNIVERSAL) ---"
+
+if getent group sudo >/dev/null; then
+    admin_group="sudo"
+elif getent group admin >/dev/null; then
+    admin_group="admin"
+else
+    echo "CRITICAL: No sudo/admin group found. Skipping privilege audit."
+    admin_group=""
+fi
+
+if [ -n "$admin_group" ]; then
+    echo "Detected admin group: $admin_group"
+
+    for user in $(awk -F: '$3 >= 1000 && $3 <= 6000 {print $1}' /etc/passwd); do
+
+        # Skip completely unauthorized users
+        if [[ ! " $all_authorized " =~ " $user " ]]; then
+            continue
+        fi
+
+        # Check current admin status
+        if id -nG "$user" | grep -qw "$admin_group"; then
+            is_admin=true
         else
-            echo "ERROR: Password must have 8+ chars, 1 uppercase, 1 number, 1 symbol." >>"$ERROR_LOG"
-            echo "ERROR: Password must have 8+ chars, 1 uppercase, 1 number, 1 symbol."
+            is_admin=false
+        fi
+
+        # Protect script runner from demotion/removal
+        if [ "$user" = "$protected_user" ]; then
+            echo "INFO: Skipping $user (script runner) to prevent lockout."
+            continue
+        fi
+
+        # CASE 1: Should be admin but isn't
+        if [[ " $admins_list " =~ " $user " ]] && [ "$is_admin" = false ]; then
+            echo "Fixing: $user should be admin. Adding to $admin_group..."
+            (sudo usermod -aG "$admin_group" "$user" >>"$LOGFILE" 2>>"$ERROR_LOG") & spin $! "1c/11" "Promoting $user to admin"
+            echo "$user promoted to admin."
+
+        # CASE 2: Should NOT be admin but is
+        elif [[ ! " $admins_list " =~ " $user " ]] && [ "$is_admin" = true ]; then
+            current_admin_count=$(getent group "$admin_group" | cut -d: -f4 | tr ',' '\n' | grep -c .)
+            if [ "$current_admin_count" -le 1 ]; then
+                echo "WARNING: Cannot remove $user — would leave system without admin."
+                continue
+            fi
+            echo "Fixing: $user should NOT be admin. Removing from $admin_group..."
+            (sudo deluser "$user" "$admin_group" >>"$LOGFILE" 2>>"$ERROR_LOG") & spin $! "1c/11" "Demoting $user from admin"
+            echo "$user demoted to standard user."
         fi
     done
-done
+fi
 
 # --- BACKUP CRITICAL FILES ---
 backup_dir="./backup_$(date +%F_%T)"
@@ -182,9 +304,4 @@ sudo systemctl start auditd >>"$LOGFILE" 2>>"$ERROR_LOG" & spin $! "11/11" "Star
 sudo systemctl enable fail2ban >>"$LOGFILE" 2>>"$ERROR_LOG" & spin $! "11/11" "Enabling fail2ban"
 sudo systemctl start fail2ban >>"$LOGFILE" 2>>"$ERROR_LOG" & spin $! "11/11" "Starting fail2ban"
 
-echo "--- HARDENING COMPLETE ---"
-echo "All actions logged in $LOGFILE"
-if [ -s "$ERROR_LOG" ]; then
-    echo "Some commands had errors. See $ERROR_LOG"
-fi
-
+echo "--- HARDENING COMPLETE
