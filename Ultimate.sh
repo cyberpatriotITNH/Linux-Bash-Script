@@ -162,8 +162,8 @@ for admin in $admins_list; do
     if [ "$need_change" = true ]; then
         valid=false
         while [ "$valid" = false ]; do
-            read -s -p "Enter new password for $admin: " new_pass; echo
-            read -s -p "Confirm password: " confirm_pass; echo
+            read -p "Enter new password for $admin: " new_pass; echo
+            read -p "Confirm password: " confirm_pass; echo
             if [[ "$new_pass" != "$confirm_pass" ]]; then
                 echo "Mismatch!"
                 continue
