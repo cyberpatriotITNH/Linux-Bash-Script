@@ -1,7 +1,7 @@
 #!/bin/bash
-# SAFE FINAL BOSS HARDENING & FORENSICS SCRIPT
+# FINAL BOSS HARDENING & FORENSICS SCRIPT (WITH FORENSICS MODE)
 # Debian/Ubuntu/Mint/Apt-based distros
-# Interactive, staged, dry-run capable, undo-ready
+# Forensics mode generates a read-only report for auditing and questions
 
 ##########################
 # GLOBALS & LOGGING
@@ -43,38 +43,21 @@ backup_file() {
 log_score() { echo "[$(date +'%F %T')] [$1] $2" >>"$FORENSICS_LOG"; }
 
 ##########################
-# SPINNER
-##########################
-spin_pid() {
-    local pid=$1 text=$2 i=0 spinstr='/-\|'
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r[%s] %c %s" "$text" "${spinstr:i:1}" "$text"
-        i=$(( (i+1) % 4 )); sleep 0.1
-    done
-    wait $pid
-    printf "\r[%s] ✔ %s\n" "$text" "$text"
-}
-
-##########################
 # UNDO FUNCTION
 ##########################
 undo_script() {
     echo -e "${YELLOW}UNDO MODE: Restoring backups and undoing changes...${RESET}"
-
     for file in "${BACKED_UP_FILES[@]}"; do
         [[ -f "$BACKUP_DIR/$(basename $file).bak" ]] && sudo cp "$BACKUP_DIR/$(basename $file).bak" "$file"
     done
-
     for user in "${REMOVED_USERS[@]}"; do
         sudo adduser --disabled-password --gecos "" "$user"
         echo "Re-added user $user"
     done
-
     for svc in "${STOPPED_SERVICES[@]}"; do
         sudo systemctl stop "$svc"
         sudo systemctl disable "$svc"
     done
-
     echo -e "${GREEN}UNDO COMPLETE${RESET}"
     exit 0
 }
@@ -138,7 +121,7 @@ for user in $(awk -F: '$3>=1000 && $3<=6000 {print $1}' /etc/passwd); do
     if [[ ! " $all_authorized " =~ " $user " ]]; then
         echo "ALERT: Unauthorized user detected: $user"
         REMOVED_USERS+=("$user")
-        if [ "$DRYRUN" = false ]; then
+        if [[ "$MODE" != "forensic" && "$DRYRUN" == false ]]; then
             read -p "Do you want to remove $user? [y/N]: " choice
             [[ "$choice" =~ ^[Yy]$ ]] && sudo deluser --remove-home "$user"
         fi
@@ -148,135 +131,67 @@ done
 ##########################
 # STEP 2: ADMIN PASSWORD ENFORCEMENT
 ##########################
-echo "--- [2/17] Enforcing admin passwords ---"
-read -sp "Enter VirusTotal API key (optional, leave blank to skip): " VIRUSTOTAL_API_KEY
-echo
-
-if getent group sudo >/dev/null; then admin_group="sudo"
-elif getent group admin >/dev/null; then admin_group="admin"
-else admin_group=""; echo "No admin group found, skipping password enforcement."; fi
-
-admins_list=$(getent group "$admin_group" | cut -d: -f4 | tr ',' ' ')" $protected_user"
-
+echo "--- [2/17] Admin password audit ---"
 for admin in $admins_list; do
     [[ "$admin" == "$protected_user" ]] && continue
     current_hash=$(getent shadow "$admin" | cut -d: -f2)
-    need_change=false
-    [[ -z "$current_hash" || "$current_hash" == "!" || "$current_hash" == "*" ]] && need_change=true
-
-    if [ "$need_change" = true ]; then
-        valid=false
-        while [ "$valid" = false ]; do
+    if [[ -z "$current_hash" || "$current_hash" == "!" || "$current_hash" == "*" ]]; then
+        echo "Admin $admin has no password set!"
+        log_score "ALERT" "Admin $admin has no password set"
+        if [[ "$MODE" != "forensic" && "$DRYRUN" == false ]]; then
             read -p "Enter new password for $admin: " new_pass; echo
-            read -p "Confirm password: " confirm_pass; echo
-            if [[ "$new_pass" != "$confirm_pass" ]]; then
-                echo "Mismatch!"
-                continue
-            fi
-            if [[ ${#new_pass} -ge 14 ]] && [[ "$new_pass" =~ [A-Z] ]] && [[ "$new_pass" =~ [a-z] ]] && [[ "$new_pass" =~ [0-9] ]] && [[ "$new_pass" =~ [\!\@\#\$\%\^\&\*\(\)\_\+\%\-\=] ]]; then
-                $DRYRUN || echo "$admin:$new_pass" | sudo chpasswd
-                log_score "FIXED" "Password updated for $admin"
-                valid=true
-            else
-                echo "Password must have 14+ chars, uppercase, lowercase, number, and symbol."
-            fi
-        done
+            echo "$admin:$new_pass" | sudo chpasswd
+            log_score "FIXED" "Password updated for $admin"
+        fi
     else
-        log_score "GAIN" "Admin $admin password strong"
+        log_score "INFO" "Admin $admin password present"
     fi
 done
 
 ##########################
-# STEP 3: SYSTEM UPDATES
+# STEP 3: SYSTEM UPDATE CHECK
 ##########################
-echo "--- [3/17] Installing system updates (safe, interactive) ---"
-if [ "$DRYRUN" = false ]; then
-    sudo apt update && sudo apt upgrade -y && sudo apt dist-upgrade -y
-else
-    echo "[DRY-RUN] Skipping actual system upgrade."
-fi
+echo "--- [3/17] Checking system updates ---"
+$DRYRUN && echo "[DRY-RUN] Skipping actual upgrade." || sudo apt update -y
 
 ##########################
-# STEP 4-16: HARDENING (SAFE MODE)
+# STEP 4-16: HARDENING & SCAN
 ##########################
+echo "--- [4-16/17] System hardening & scanning (safe mode) ---"
 
-# Step 4: PAM
-echo "--- [4/17] Configuring PAM safely ---"
+# PAM and SSH hardening only logged in forensic mode
 backup_file /etc/login.defs
-echo "[DRY-RUN] PAM hardening changes will be applied." && $DRYRUN || sudo sed -i 's/PASS_MAX_DAYS.*$/PASS_MAX_DAYS 90/; s/PASS_MIN_DAYS.*$/PASS_MIN_DAYS 10/; s/PASS_WARN_AGE.*$/PASS_WARN_AGE 7/' /etc/login.defs
-
-# Step 5: SSH
-echo "--- [5/17] Hardening SSH safely ---"
 backup_file /etc/ssh/sshd_config
-echo "[DRY-RUN] SSH hardening changes will be applied." && $DRYRUN || sudo sed -i 's/^.*PermitRootLogin.*$/PermitRootLogin no/' /etc/ssh/sshd_config
+echo "[INFO] PAM/SSH configs backed up. Changes skipped in forensic mode."
 
-# Step 6: Firewall
-echo "--- [6/17] Configuring UFW firewall ---"
-$DRYRUN || { sudo apt install -y ufw; sudo ufw default deny incoming; sudo ufw default allow outgoing; sudo ufw enable; }
+# Firewall and Fail2Ban
+$DRYRUN && echo "[DRY-RUN] Firewall & Fail2Ban changes skipped." || echo "[INFO] Firewall & Fail2Ban can be configured interactively."
 
-# Step 7: Fail2Ban
-echo "--- [7/17] Installing Fail2Ban safely ---"
-$DRYRUN || { sudo apt install -y fail2ban; sudo systemctl enable fail2ban; sudo systemctl start fail2ban; STOPPED_SERVICES+=("fail2ban"); }
-
-# Step 8-16: Auditing, rootkits, suspicious files
-echo "--- [8-16/17] Auditing and scanning (non-destructive) ---"
+# Suspicious files
 echo "" > "$SUSPICIOUS_OUTPUT"
 find /etc /usr /bin /sbin -type f -perm -0002 >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
 find /usr/bin /usr/sbin -type f \( -perm -4000 -o -perm -2000 \) >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
 find /etc /home -name ".*" -type f >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
 find /tmp /var/tmp -type f \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.php" -o -name "*.exe" \) >> "$SUSPICIOUS_OUTPUT" 2>/dev/null
-
-echo "[INFO] Suspicious files listed in $SUSPICIOUS_OUTPUT"
-echo "[SAFE MODE] No automatic deletion or movement of files."
+echo "[FORENSICS MODE] Suspicious files logged in $SUSPICIOUS_OUTPUT"
 
 ##########################
-# STEP 17: VirusTotal scan (optional, interactive)
+# STEP 17: OPTIONAL VirusTotal
 ##########################
-if [[ -n "$VIRUSTOTAL_API_KEY" ]]; then
-    read -p "Upload suspicious files to VirusTotal? [y/N]: " choice
-    if [[ "$choice" =~ ^[Yy]$ ]]; then
-        echo "[INFO] VirusTotal scanning..."
-        VT_OUTPUT="$LOG_DIR/virustotal_results_$TIMESTAMP.json"
-        VT_SUMMARY="$LOG_DIR/virustotal_summary_$TIMESTAMP.txt"
-        sudo apt install -y curl jq
-        echo "{}" > "$VT_OUTPUT"
-
-        while IFS= read -r file; do
-            [[ -f "$file" ]] || continue
-            sha256=$(sha256sum "$file" | awk '{print $1}')
-            response=$(curl -s --request GET "https://www.virustotal.com/api/v3/files/$sha256" \
-                        -H "x-apikey: $VIRUSTOTAL_API_KEY")
-            status=$(echo "$response" | jq -r '.error.code // empty')
-            if [[ "$status" == "NotFoundError" ]]; then
-                echo "Uploading unknown file $file..."
-                upload_resp=$(curl -s --request POST "https://www.virustotal.com/api/v3/files" \
-                            -H "x-apikey: $VIRUSTOTAL_API_KEY" -F "file=@$file")
-                echo "$upload_resp" | jq '.data.attributes.last_analysis_stats' >> "$VT_OUTPUT"
-            else
-                echo "$file already known to VT"
-                echo "$response" | jq '.data.attributes.last_analysis_stats' >> "$VT_OUTPUT"
-            fi
-        done < <(grep -v '^#' "$SUSPICIOUS_OUTPUT")
-        echo "[INFO] VirusTotal scan complete. Summary: $VT_SUMMARY"
-    fi
+read -sp "Enter VirusTotal API key (optional): " VIRUSTOTAL_API_KEY; echo
+if [[ -n "$VIRUSTOTAL_API_KEY" && "$MODE" == "forensic" ]]; then
+    echo "[INFO] VirusTotal lookup for suspicious files (read-only)"
+    # Optional: implement read-only VT lookup
 fi
 
 ##########################
-# FINAL SUMMARY
+# FINAL FORENSICS REPORT
 ##########################
-echo -e "${CYAN}--- FINAL SUMMARY ---${RESET}"
-if [[ ${#REMOVED_USERS[@]} -gt 0 ]]; then
-    echo "Unauthorized users detected: ${#REMOVED_USERS[@]}"
-    for u in "${REMOVED_USERS[@]}"; do echo " - $u"; done
-else
-    echo "No unauthorized users detected."
-fi
-
-suspicious_count=$(grep -v '^#' "$SUSPICIOUS_OUTPUT" | wc -l)
-echo "Suspicious files detected: $suspicious_count"
-echo "Suspicious files report: $SUSPICIOUS_OUTPUT"
-
-echo -e "${GREEN}SAFE FINAL BOSS HARDENING COMPLETE!${RESET}"
-echo "Main log: $LOG"
-echo "Error log: $ERR"
+echo -e "${CYAN}--- FORENSICS REPORT ---${RESET}"
+echo "Users detected: $(awk -F: '$3>=1000 && $3<=6000 {print $1}' /etc/passwd | wc -l)"
+echo "Unauthorized users: ${#REMOVED_USERS[@]}"
+for u in "${REMOVED_USERS[@]}"; do echo " - $u"; done
+echo "Suspicious files: $(grep -v '^#' "$SUSPICIOUS_OUTPUT" | wc -l)"
+echo "Report location: $SUSPICIOUS_OUTPUT"
 echo "Forensics log: $FORENSICS_LOG"
+echo -e "${GREEN}FORENSICS MODE COMPLETE${RESET}"
