@@ -1,7 +1,7 @@
 #!/bin/bash
 # FINAL BOSS HARDENING & FORENSICS SCRIPT (WITH FORENSICS MODE)
 # Debian/Ubuntu/Mint/Apt-based distros
-# Forensics mode generates a read-only report for auditing and questions
+# Forensics mode generates a read-only report for auditing and questions, for forensics questions
 
 ##########################
 # GLOBALS & LOGGING
